@@ -485,6 +485,67 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Decodes up to `max_values`, invoking `emit` once per contiguous run of equal values.
+    ///
+    /// Native RLE runs are emitted without materializing their logical values. Bit-packed runs are
+    /// decoded through a bounded scratch buffer. Equal values at separate calls may be emitted as
+    /// separate runs.
+    #[inline(never)]
+    pub fn read_runs<F>(&mut self, max_values: usize, mut emit: F) -> Result<usize>
+    where
+        F: FnMut(u64, usize) -> Result<()>,
+    {
+        let mut values_read = 0;
+        let mut pending = None;
+        let mut bit_packed_values = [0_u64; RLE_DECODER_INDEX_BUFFER_SIZE];
+
+        while values_read < max_values {
+            if self.rle_left > 0 {
+                let run_length = (max_values - values_read).min(self.rle_left as usize);
+                let value = self
+                    .current_value
+                    .ok_or_else(|| general_err!("current_value should be Some"))?;
+                accumulate_run(&mut pending, value, run_length, &mut emit)?;
+                self.rle_left -= run_length as u32;
+                values_read += run_length;
+                continue;
+            }
+
+            if self.bit_packed_left > 0 {
+                let requested = (max_values - values_read)
+                    .min(self.bit_packed_left as usize)
+                    .min(bit_packed_values.len());
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let decoded = bit_reader.get_batch::<u64>(
+                    &mut bit_packed_values[..requested],
+                    self.bit_width as usize,
+                );
+                if decoded == 0 {
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                for &value in &bit_packed_values[..decoded] {
+                    accumulate_run(&mut pending, value, 1, &mut emit)?;
+                }
+                self.bit_packed_left -= decoded as u32;
+                values_read += decoded;
+                continue;
+            }
+
+            if !self.reload()? {
+                break;
+            }
+        }
+
+        if let Some((value, run_length)) = pending {
+            emit(value, run_length)?;
+        }
+        Ok(values_read)
+    }
+
     #[inline(never)]
     pub fn skip(&mut self, num_values: usize) -> Result<usize> {
         let mut values_skipped = 0;
@@ -660,6 +721,29 @@ impl RleDecoder {
     }
 }
 
+fn accumulate_run<F>(
+    pending: &mut Option<(u64, usize)>,
+    value: u64,
+    run_length: usize,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u64, usize) -> Result<()>,
+{
+    match pending {
+        Some((pending_value, pending_length)) if *pending_value == value => {
+            *pending_length += run_length;
+        }
+        Some((pending_value, pending_length)) => {
+            emit(*pending_value, *pending_length)?;
+            *pending_value = value;
+            *pending_length = run_length;
+        }
+        None => *pending = Some((value, run_length)),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +765,91 @@ mod tests {
         let result = decoder.get_batch::<i32>(&mut buffer);
         assert!(result.is_ok());
         assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn test_read_runs_coalesces_hybrid_encoding() {
+        let logical_values = [0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7];
+        let mut encoder = RleEncoder::new(3, 256);
+        for value in logical_values {
+            encoder.put(value);
+        }
+
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = Vec::new();
+        let decoded = decoder
+            .read_runs(logical_values.len(), |value, run_length| {
+                runs.push((value, run_length));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(decoded, logical_values.len());
+        assert_eq!(
+            runs,
+            vec![
+                (0, 1),
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (5, 1),
+                (6, 1),
+                (7, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_read_runs_bounds_and_resumes_a_run() {
+        let mut encoder = RleEncoder::new(3, 256);
+        encoder.put_run(5, 20);
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+
+        let mut first = Vec::new();
+        let first_count = decoder
+            .read_runs(7, |value, run_length| {
+                first.push((value, run_length));
+                Ok(())
+            })
+            .unwrap();
+        let mut second = Vec::new();
+        let second_count = decoder
+            .read_runs(13, |value, run_length| {
+                second.push((value, run_length));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(first_count, 7);
+        assert_eq!(first, vec![(5, 7)]);
+        assert_eq!(second_count, 13);
+        assert_eq!(second, vec![(5, 13)]);
+    }
+
+    #[test]
+    fn test_read_runs_keeps_long_runs_physical() {
+        for logical_length in [4_096, 1_000_000] {
+            let mut encoder = RleEncoder::new(2, 16);
+            encoder.put_run(3, logical_length);
+            let encoded = encoder.consume();
+            assert!(encoded.len() < 16);
+
+            let mut decoder = RleDecoder::new(2);
+            decoder.set_data(Bytes::from(encoded)).unwrap();
+            let mut runs = Vec::new();
+            let decoded = decoder
+                .read_runs(logical_length, |value, run_length| {
+                    runs.push((value, run_length));
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(decoded, logical_length);
+            assert_eq!(runs, vec![(3, logical_length)]);
+        }
     }
 
     #[test]
