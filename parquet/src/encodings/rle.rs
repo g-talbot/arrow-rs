@@ -401,6 +401,16 @@ impl RleDecoder {
 
     #[inline]
     pub fn set_data(&mut self, data: Bytes) -> Result<()> {
+        if self.bit_width > u64::BITS as u8 {
+            return Err(general_err!(
+                "parquet_data_error: RLE bit width {} exceeds 64",
+                self.bit_width
+            ));
+        }
+
+        self.rle_left = 0;
+        self.bit_packed_left = 0;
+        self.current_value = None;
         if let Some(ref mut bit_reader) = self.bit_reader {
             bit_reader.reset(data);
         } else {
@@ -532,6 +542,15 @@ impl RleDecoder {
             }
 
             if self.bit_packed_left > 0 {
+                if self.bit_width == 0 {
+                    let run_length =
+                        (max_values - values_read).min(self.bit_packed_left as usize);
+                    accumulate_run(runs, initial_runs, 0, run_length);
+                    self.bit_packed_left -= run_length as u32;
+                    values_read += run_length;
+                    continue;
+                }
+
                 let requested = (max_values - values_read)
                     .min(self.bit_packed_left as usize)
                     .min(RLE_DECODER_BATCH_SIZE);
@@ -959,6 +978,69 @@ mod tests {
 
         assert_eq!(decoded, 10);
         assert_eq!(runs.iter().map(|(_, length)| length).sum::<usize>(), 10);
+    }
+
+    #[test]
+    fn test_set_data_replaces_partially_read_bit_packed_data() {
+        let mut bit_packed = RleEncoder::new(3, 16);
+        for value in [1, 2, 3] {
+            bit_packed.put(value);
+        }
+        let mut decoder = RleDecoder::new(3);
+        decoder
+            .set_data(Bytes::from(bit_packed.consume()))
+            .unwrap();
+        let mut initial_runs = Vec::new();
+        assert_eq!(decoder.read_runs_into(3, &mut initial_runs).unwrap(), 3);
+        assert_eq!(decoder.bit_packed_left, 5);
+
+        let mut rle = RleEncoder::new(3, 16);
+        rle.put_run(5, 9);
+        rle.put_run(6, 9);
+        decoder.set_data(Bytes::from(rle.consume())).unwrap();
+        let mut replacement_runs = Vec::new();
+
+        let decoded = decoder
+            .read_runs_into(18, &mut replacement_runs)
+            .unwrap();
+
+        assert_eq!(decoded, 18);
+        assert_eq!(replacement_runs, vec![(5, 9), (6, 9)]);
+    }
+
+    #[test]
+    fn test_read_runs_keeps_large_zero_width_bit_packed_runs_physical() {
+        const VALUES_PER_RUN: u64 = 1_000_000;
+        let header = encode_run_header((VALUES_PER_RUN / BIT_PACK_GROUP_SIZE as u64) << 1 | 1);
+        let mut data = header.clone();
+        data.extend_from_slice(&header);
+        let mut decoder = RleDecoder::new(0);
+        decoder.set_data(Bytes::from(data)).unwrap();
+        let mut runs = Vec::new();
+
+        let decoded = decoder
+            .read_runs_into((VALUES_PER_RUN * 2) as usize, &mut runs)
+            .unwrap();
+
+        assert_eq!(decoded, (VALUES_PER_RUN * 2) as usize);
+        assert_eq!(runs, vec![(0, (VALUES_PER_RUN * 2) as usize)]);
+        assert!(decoder.bit_packed_values.is_none());
+    }
+
+    #[test]
+    fn test_set_data_rejects_invalid_bit_width_for_rle_run() {
+        let mut data = vec![2];
+        data.extend_from_slice(&[0; 9]);
+        let mut decoder = RleDecoder::new(65);
+
+        assert!(decoder.set_data(Bytes::from(data)).is_err());
+    }
+
+    #[test]
+    fn test_set_data_rejects_invalid_bit_width_for_bit_packed_run() {
+        let mut decoder = RleDecoder::new(65);
+
+        assert!(decoder.set_data(Bytes::from_static(&[3])).is_err());
     }
 
     #[test]
