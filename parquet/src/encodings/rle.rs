@@ -360,7 +360,7 @@ impl RleEncoder {
 }
 
 /// Number of values buffered when batch-reading hybrid-encoded data.
-const RLE_DECODER_INDEX_BUFFER_SIZE: usize = 1024;
+const RLE_DECODER_BATCH_SIZE: usize = 1024;
 
 /// A RLE/Bit-Packing hybrid decoder.
 pub struct RleDecoder {
@@ -371,10 +371,10 @@ pub struct RleDecoder {
     bit_reader: Option<BitReader>,
 
     // Buffer used when `bit_reader` is not `None`, for batch reading.
-    index_buf: Option<Box<[i32; RLE_DECODER_INDEX_BUFFER_SIZE]>>,
+    index_buf: Option<Box<[i32; RLE_DECODER_BATCH_SIZE]>>,
 
     // Lazily allocated buffer for decoded bit-packed values.
-    run_buf: Option<Box<[u64; RLE_DECODER_INDEX_BUFFER_SIZE]>>,
+    bit_packed_values: Option<Box<[u64; RLE_DECODER_BATCH_SIZE]>>,
 
     // The remaining number of values in RLE for this run
     rle_left: u32,
@@ -394,7 +394,7 @@ impl RleDecoder {
             bit_packed_left: 0,
             bit_reader: None,
             index_buf: None,
-            run_buf: None,
+            bit_packed_values: None,
             current_value: None,
         }
     }
@@ -534,10 +534,10 @@ impl RleDecoder {
             if self.bit_packed_left > 0 {
                 let requested = (max_values - values_read)
                     .min(self.bit_packed_left as usize)
-                    .min(RLE_DECODER_INDEX_BUFFER_SIZE);
+                    .min(RLE_DECODER_BATCH_SIZE);
                 let bit_packed_values = self
-                    .run_buf
-                    .get_or_insert_with(|| Box::new([0_u64; RLE_DECODER_INDEX_BUFFER_SIZE]));
+                    .bit_packed_values
+                    .get_or_insert_with(|| Box::new([0_u64; RLE_DECODER_BATCH_SIZE]));
                 let bit_reader = self
                     .bit_reader
                     .as_mut()
@@ -796,7 +796,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded, logical_values.len());
-        assert!(decoder.run_buf.is_some());
+        assert!(decoder.bit_packed_values.is_some());
         assert_eq!(
             runs,
             vec![
@@ -847,7 +847,7 @@ mod tests {
 
             assert_eq!(decoded, logical_length);
             assert_eq!(runs, vec![(3, logical_length)]);
-            assert!(decoder.run_buf.is_none());
+            assert!(decoder.bit_packed_values.is_none());
         }
     }
 
@@ -877,6 +877,43 @@ mod tests {
 
         assert!(decoder.read_runs_into(5, &mut runs).is_err());
         assert_eq!(runs, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn test_read_runs_crosses_bit_packed_scratch_boundary() {
+        let logical_values: Vec<u64> = (0..2_057).map(|index| (index % 7) as u64).collect();
+        let mut encoder = RleEncoder::new(3, 4_096);
+        for &value in &logical_values {
+            encoder.put(value);
+        }
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = Vec::new();
+
+        let decoded = decoder
+            .read_runs_into(logical_values.len(), &mut runs)
+            .unwrap();
+        let expanded: Vec<u64> = runs
+            .iter()
+            .flat_map(|&(value, length)| std::iter::repeat_n(value, length))
+            .collect();
+
+        assert_eq!(decoded, logical_values.len());
+        assert_eq!(expanded, logical_values);
+    }
+
+    #[test]
+    fn test_read_runs_reports_truncated_bit_packed_count() {
+        let mut decoder = RleDecoder::new(8);
+        let mut data = vec![5]; // Two bit-packed groups declare sixteen values.
+        data.extend(0_u8..10);
+        decoder.set_data(Bytes::from(data)).unwrap();
+        let mut runs = Vec::new();
+
+        let decoded = decoder.read_runs_into(16, &mut runs).unwrap();
+
+        assert_eq!(decoded, 10);
+        assert_eq!(runs.iter().map(|(_, length)| length).sum::<usize>(), 10);
     }
 
     #[test]
