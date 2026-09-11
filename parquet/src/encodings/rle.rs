@@ -359,7 +359,7 @@ impl RleEncoder {
     }
 }
 
-/// Size, in number of `i32s` of buffer to use for RLE batch reading
+/// Number of values buffered when batch-reading hybrid-encoded data.
 const RLE_DECODER_INDEX_BUFFER_SIZE: usize = 1024;
 
 /// A RLE/Bit-Packing hybrid decoder.
@@ -372,6 +372,9 @@ pub struct RleDecoder {
 
     // Buffer used when `bit_reader` is not `None`, for batch reading.
     index_buf: Option<Box<[i32; RLE_DECODER_INDEX_BUFFER_SIZE]>>,
+
+    // Lazily allocated buffer for decoded bit-packed values.
+    run_buf: Option<Box<[u64; RLE_DECODER_INDEX_BUFFER_SIZE]>>,
 
     // The remaining number of values in RLE for this run
     rle_left: u32,
@@ -391,6 +394,7 @@ impl RleDecoder {
             bit_packed_left: 0,
             bit_reader: None,
             index_buf: None,
+            run_buf: None,
             current_value: None,
         }
     }
@@ -485,19 +489,35 @@ impl RleDecoder {
         Ok(values_read)
     }
 
-    /// Decodes up to `max_values`, invoking `emit` once per contiguous run of equal values.
+    /// Decodes up to `max_values` and appends contiguous runs to `runs`.
     ///
     /// Native RLE runs are emitted without materializing their logical values. Bit-packed runs are
-    /// decoded through a bounded scratch buffer. Equal values at separate calls may be emitted as
-    /// separate runs.
+    /// decoded through a bounded, lazily allocated scratch buffer. Runs appended by one call are
+    /// coalesced with each other, but never with entries already present in `runs`. On success, the
+    /// appended run lengths sum to the returned count; a count below `max_values` indicates EOF.
+    /// On error, `runs` is restored to its original length and the decoder must not be reused.
+    #[allow(dead_code)]
     #[inline(never)]
-    pub fn read_runs<F>(&mut self, max_values: usize, mut emit: F) -> Result<usize>
-    where
-        F: FnMut(u64, usize) -> Result<()>,
-    {
+    pub fn read_runs_into(
+        &mut self,
+        max_values: usize,
+        runs: &mut Vec<(u64, usize)>,
+    ) -> Result<usize> {
+        let initial_runs = runs.len();
+        let result = self.read_runs_into_inner(max_values, runs, initial_runs);
+        if result.is_err() {
+            runs.truncate(initial_runs);
+        }
+        result
+    }
+
+    fn read_runs_into_inner(
+        &mut self,
+        max_values: usize,
+        runs: &mut Vec<(u64, usize)>,
+        initial_runs: usize,
+    ) -> Result<usize> {
         let mut values_read = 0;
-        let mut pending = None;
-        let mut bit_packed_values = [0_u64; RLE_DECODER_INDEX_BUFFER_SIZE];
 
         while values_read < max_values {
             if self.rle_left > 0 {
@@ -505,7 +525,7 @@ impl RleDecoder {
                 let value = self
                     .current_value
                     .ok_or_else(|| general_err!("current_value should be Some"))?;
-                accumulate_run(&mut pending, value, run_length, &mut emit)?;
+                accumulate_run(runs, initial_runs, value, run_length);
                 self.rle_left -= run_length as u32;
                 values_read += run_length;
                 continue;
@@ -514,7 +534,10 @@ impl RleDecoder {
             if self.bit_packed_left > 0 {
                 let requested = (max_values - values_read)
                     .min(self.bit_packed_left as usize)
-                    .min(bit_packed_values.len());
+                    .min(RLE_DECODER_INDEX_BUFFER_SIZE);
+                let bit_packed_values = self
+                    .run_buf
+                    .get_or_insert_with(|| Box::new([0_u64; RLE_DECODER_INDEX_BUFFER_SIZE]));
                 let bit_reader = self
                     .bit_reader
                     .as_mut()
@@ -528,7 +551,7 @@ impl RleDecoder {
                     continue;
                 }
                 for &value in &bit_packed_values[..decoded] {
-                    accumulate_run(&mut pending, value, 1, &mut emit)?;
+                    accumulate_run(runs, initial_runs, value, 1);
                 }
                 self.bit_packed_left -= decoded as u32;
                 values_read += decoded;
@@ -538,10 +561,6 @@ impl RleDecoder {
             if !self.reload()? {
                 break;
             }
-        }
-
-        if let Some((value, run_length)) = pending {
-            emit(value, run_length)?;
         }
         Ok(values_read)
     }
@@ -721,27 +740,21 @@ impl RleDecoder {
     }
 }
 
-fn accumulate_run<F>(
-    pending: &mut Option<(u64, usize)>,
+#[allow(dead_code)]
+fn accumulate_run(
+    runs: &mut Vec<(u64, usize)>,
+    initial_runs: usize,
     value: u64,
     run_length: usize,
-    emit: &mut F,
-) -> Result<()>
-where
-    F: FnMut(u64, usize) -> Result<()>,
-{
-    match pending {
-        Some((pending_value, pending_length)) if *pending_value == value => {
-            *pending_length += run_length;
-        }
-        Some((pending_value, pending_length)) => {
-            emit(*pending_value, *pending_length)?;
-            *pending_value = value;
-            *pending_length = run_length;
-        }
-        None => *pending = Some((value, run_length)),
+) {
+    if runs.len() > initial_runs
+        && let Some((last_value, last_length)) = runs.last_mut()
+        && *last_value == value
+    {
+        *last_length += run_length;
+        return;
     }
-    Ok(())
+    runs.push((value, run_length));
 }
 
 #[cfg(test)]
@@ -779,13 +792,11 @@ mod tests {
         decoder.set_data(Bytes::from(encoder.consume())).unwrap();
         let mut runs = Vec::new();
         let decoded = decoder
-            .read_runs(logical_values.len(), |value, run_length| {
-                runs.push((value, run_length));
-                Ok(())
-            })
+            .read_runs_into(logical_values.len(), &mut runs)
             .unwrap();
 
         assert_eq!(decoded, logical_values.len());
+        assert!(decoder.run_buf.is_some());
         assert_eq!(
             runs,
             vec![
@@ -809,19 +820,9 @@ mod tests {
         decoder.set_data(Bytes::from(encoder.consume())).unwrap();
 
         let mut first = Vec::new();
-        let first_count = decoder
-            .read_runs(7, |value, run_length| {
-                first.push((value, run_length));
-                Ok(())
-            })
-            .unwrap();
+        let first_count = decoder.read_runs_into(7, &mut first).unwrap();
         let mut second = Vec::new();
-        let second_count = decoder
-            .read_runs(13, |value, run_length| {
-                second.push((value, run_length));
-                Ok(())
-            })
-            .unwrap();
+        let second_count = decoder.read_runs_into(13, &mut second).unwrap();
 
         assert_eq!(first_count, 7);
         assert_eq!(first, vec![(5, 7)]);
@@ -841,15 +842,41 @@ mod tests {
             decoder.set_data(Bytes::from(encoded)).unwrap();
             let mut runs = Vec::new();
             let decoded = decoder
-                .read_runs(logical_length, |value, run_length| {
-                    runs.push((value, run_length));
-                    Ok(())
-                })
+                .read_runs_into(logical_length, &mut runs)
                 .unwrap();
 
             assert_eq!(decoded, logical_length);
             assert_eq!(runs, vec![(3, logical_length)]);
+            assert!(decoder.run_buf.is_none());
         }
+    }
+
+    #[test]
+    fn test_read_runs_does_not_coalesce_with_existing_output() {
+        let mut encoder = RleEncoder::new(3, 64);
+        encoder.put_run(5, 20);
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = vec![(5, 99)];
+
+        let decoded = decoder.read_runs_into(20, &mut runs).unwrap();
+
+        assert_eq!(decoded, 20);
+        assert_eq!(runs, vec![(5, 99), (5, 20)]);
+    }
+
+    #[test]
+    fn test_read_runs_rolls_back_output_on_malformed_tail() {
+        let mut encoder = RleEncoder::new(3, 64);
+        encoder.put_run(5, 4);
+        let mut encoded = encoder.consume();
+        encoded.push(2);
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoded)).unwrap();
+        let mut runs = vec![(1, 2)];
+
+        assert!(decoder.read_runs_into(5, &mut runs).is_err());
+        assert_eq!(runs, vec![(1, 2)]);
     }
 
     #[test]
