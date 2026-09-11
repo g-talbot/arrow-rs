@@ -384,6 +384,9 @@ pub struct RleDecoder {
 
     // The current value for the case of RLE mode
     current_value: Option<u64>,
+
+    // Whether a non-spec zero header was consumed as trailing padding.
+    zero_header_consumed: bool,
 }
 
 impl RleDecoder {
@@ -396,6 +399,7 @@ impl RleDecoder {
             index_buf: None,
             bit_packed_values: None,
             current_value: None,
+            zero_header_consumed: false,
         }
     }
 
@@ -411,6 +415,7 @@ impl RleDecoder {
         self.rle_left = 0;
         self.bit_packed_left = 0;
         self.current_value = None;
+        self.zero_header_consumed = false;
         if let Some(ref mut bit_reader) = self.bit_reader {
             bit_reader.reset(data);
         } else {
@@ -519,6 +524,64 @@ impl RleDecoder {
             runs.truncate(initial_runs);
         }
         result
+    }
+
+    /// Finishes the current input after its exact logical value count has been decoded.
+    ///
+    /// The final bit-packed group may contain up to seven padding values. Their encoded bits must
+    /// be present unless `bit_width` is zero. Native RLE values, a complete additional bit-packed
+    /// group, a zero padding header, and any byte-aligned trailing data are rejected.
+    ///
+    /// The caller must separately verify that its preceding decode returned the expected logical
+    /// count. This method does not change output already appended by [`Self::read_runs_into`]. On
+    /// error, decoder state may have advanced and must be reset with [`Self::set_data`] before
+    /// reuse.
+    #[allow(dead_code)]
+    pub fn finish_page(&mut self) -> Result<()> {
+        if self.rle_left > 0 {
+            return Err(general_err!(
+                "parquet_data_error: {} RLE values remain after the logical page end",
+                self.rle_left
+            ));
+        }
+        if self.bit_packed_left >= BIT_PACK_GROUP_SIZE as u32 {
+            return Err(general_err!(
+                "parquet_data_error: {} bit-packed values remain after the logical page end",
+                self.bit_packed_left
+            ));
+        }
+        if self.zero_header_consumed {
+            return Err(general_err!(
+                "parquet_data_error: zero run header remains after the logical page end"
+            ));
+        }
+
+        let bit_reader = self
+            .bit_reader
+            .as_mut()
+            .ok_or_else(|| general_err!("bit_reader should be set"))?;
+        let padding_values = self.bit_packed_left as usize;
+        if padding_values > 0 && self.bit_width > 0 {
+            let skipped = bit_reader.skip(padding_values, self.bit_width as usize);
+            self.bit_packed_left -= skipped as u32;
+            if skipped != padding_values {
+                return Err(eof_err!(
+                    "not enough data for {} final bit-packed padding values",
+                    padding_values - skipped
+                ));
+            }
+        }
+        self.bit_packed_left = 0;
+
+        let trailing_bytes = bit_reader.remaining_aligned_bytes();
+        if trailing_bytes > 0 {
+            return Err(general_err!(
+                "parquet_data_error: {} trailing bytes remain after the logical page end",
+                trailing_bytes
+            ));
+        }
+        self.current_value = None;
+        Ok(())
     }
 
     fn read_runs_into_inner(
@@ -740,6 +803,7 @@ impl RleDecoder {
             // but is handled by the C++ implementation
             // <https://github.com/apache/arrow/blob/8074496cb41bc8ec8fe9fc814ca5576d89a6eb94/cpp/src/arrow/util/rle_encoding.h#L653>
             if indicator_value == 0 {
+                self.zero_header_consumed = true;
                 return Ok(false);
             }
             if indicator_value & 1 == 1 {
@@ -1025,6 +1089,125 @@ mod tests {
         assert_eq!(decoded, (VALUES_PER_RUN * 2) as usize);
         assert_eq!(runs, vec![(0, (VALUES_PER_RUN * 2) as usize)]);
         assert!(decoder.bit_packed_values.is_none());
+    }
+
+    #[test]
+    fn test_finish_page_accepts_final_bit_packed_padding() {
+        let mut encoder = RleEncoder::new(3, 16);
+        for value in [1, 2, 3] {
+            encoder.put(value);
+        }
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(3, &mut runs).unwrap(), 3);
+        assert_eq!(decoder.bit_packed_left, 5);
+        assert!(decoder.finish_page().is_ok());
+    }
+
+    #[test]
+    fn test_finish_page_rejects_missing_bit_packed_padding() {
+        let mut decoder = RleDecoder::new(2);
+        decoder.set_data(Bytes::from_static(&[3, 0])).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(4, &mut runs).unwrap(), 4);
+        assert!(decoder.finish_page().is_err());
+    }
+
+    #[test]
+    fn test_finish_page_rejects_leftover_rle_values() {
+        let mut encoder = RleEncoder::new(3, 16);
+        encoder.put_run(5, 9);
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(8, &mut runs).unwrap(), 8);
+        assert!(decoder.finish_page().is_err());
+    }
+
+    #[test]
+    fn test_finish_page_accepts_exact_rle_run() {
+        let mut encoder = RleEncoder::new(3, 16);
+        encoder.put_run(5, 9);
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(9, &mut runs).unwrap(), 9);
+        assert!(decoder.finish_page().is_ok());
+    }
+
+    #[test]
+    fn test_finish_page_rejects_trailing_rle_run() {
+        let mut encoder = RleEncoder::new(3, 16);
+        encoder.put_run(5, 8);
+        encoder.put_run(6, 8);
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(Bytes::from(encoder.consume())).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(8, &mut runs).unwrap(), 8);
+        assert!(decoder.finish_page().is_err());
+    }
+
+    #[test]
+    fn test_finish_page_rejects_extra_bit_packed_group() {
+        let mut decoder = RleDecoder::new(1);
+        decoder
+            .set_data(Bytes::from_static(&[5, 0, 0]))
+            .unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(8, &mut runs).unwrap(), 8);
+        assert!(decoder.finish_page().is_err());
+    }
+
+    #[test]
+    fn test_finish_page_rejects_overlong_trailing_header() {
+        let mut data = vec![2, 0];
+        data.extend_from_slice(&[0x80; bit_util::MAX_VLQ_BYTE_LEN + 1]);
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(Bytes::from(data)).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(decoder.read_runs_into(1, &mut runs).unwrap(), 1);
+        assert!(decoder.finish_page().is_err());
+    }
+
+    #[test]
+    fn test_finish_page_accepts_zero_width_padding_without_materializing() {
+        const DECLARED_VALUES: u64 = 1_000_000;
+        const LOGICAL_VALUES: usize = DECLARED_VALUES as usize - 5;
+        let header = encode_run_header(
+            (DECLARED_VALUES / BIT_PACK_GROUP_SIZE as u64) << 1 | 1,
+        );
+        let mut decoder = RleDecoder::new(0);
+        decoder.set_data(Bytes::from(header)).unwrap();
+        let mut runs = Vec::new();
+
+        assert_eq!(
+            decoder
+                .read_runs_into(LOGICAL_VALUES, &mut runs)
+                .unwrap(),
+            LOGICAL_VALUES
+        );
+        assert!(decoder.finish_page().is_ok());
+        assert_eq!(runs, vec![(0, LOGICAL_VALUES)]);
+        assert!(decoder.bit_packed_values.is_none());
+    }
+
+    #[test]
+    fn test_finish_page_requires_empty_data_for_zero_logical_values() {
+        let mut empty_decoder = RleDecoder::new(0);
+        empty_decoder.set_data(Bytes::new()).unwrap();
+        assert!(empty_decoder.finish_page().is_ok());
+
+        let mut padded_decoder = RleDecoder::new(0);
+        padded_decoder.set_data(Bytes::from_static(&[0])).unwrap();
+        assert!(padded_decoder.finish_page().is_err());
     }
 
     #[test]

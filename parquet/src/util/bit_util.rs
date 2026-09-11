@@ -667,6 +667,12 @@ impl BitReader {
         self.byte_offset + ceil(self.bit_offset, 8)
     }
 
+    /// Returns the number of bytes a byte-aligned read could still consume.
+    #[inline]
+    pub(crate) fn remaining_aligned_bytes(&self) -> usize {
+        self.buffer.len() - self.get_byte_offset()
+    }
+
     /// Reads a single bit-packed value of `num_bits` bits as a `T` from the
     /// stream.
     ///
