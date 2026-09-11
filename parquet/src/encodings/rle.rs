@@ -716,7 +716,7 @@ impl RleDecoder {
             .as_mut()
             .ok_or_else(|| general_err!("bit_reader should be set"))?;
 
-        if let Some(indicator_value) = bit_reader.get_vlq_int() {
+        if let Some(indicator_value) = read_run_header(bit_reader)? {
             // fastparquet adds padding to the end of pages. This is not spec-compliant
             // but is handled by the C++ implementation
             // <https://github.com/apache/arrow/blob/8074496cb41bc8ec8fe9fc814ca5576d89a6eb94/cpp/src/arrow/util/rle_encoding.h#L653>
@@ -724,9 +724,22 @@ impl RleDecoder {
                 return Ok(false);
             }
             if indicator_value & 1 == 1 {
-                self.bit_packed_left = ((indicator_value >> 1) * BIT_PACK_GROUP_SIZE as i64) as u32;
+                let group_count = indicator_value >> 1;
+                if group_count == 0 {
+                    return Err(general_err!(
+                        "parquet_data_error: bit-packed run has zero groups"
+                    ));
+                }
+                self.bit_packed_left = group_count
+                    .checked_mul(BIT_PACK_GROUP_SIZE as u64)
+                    .and_then(|value_count| u32::try_from(value_count).ok())
+                    .ok_or_else(|| {
+                        general_err!("parquet_data_error: bit-packed run length overflows u32")
+                    })?;
             } else {
-                self.rle_left = (indicator_value >> 1) as u32;
+                self.rle_left = u32::try_from(indicator_value >> 1).map_err(|_| {
+                    general_err!("parquet_data_error: RLE run length overflows u32")
+                })?;
                 let value_width = bit_util::ceil(self.bit_width as usize, u8::BITS as usize);
                 self.current_value = bit_reader.get_aligned::<u64>(value_width);
                 self.current_value.ok_or_else(|| {
@@ -738,6 +751,38 @@ impl RleDecoder {
             Ok(false)
         }
     }
+}
+
+fn read_run_header(bit_reader: &mut BitReader) -> Result<Option<u64>> {
+    let mut value = 0_u64;
+
+    for byte_index in 0..bit_util::MAX_VLQ_BYTE_LEN {
+        let byte = match bit_reader.get_aligned::<u8>(1) {
+            Some(byte) => byte,
+            None if byte_index == 0 => return Ok(None),
+            None => {
+                return Err(eof_err!(
+                    "unexpected end of file while decoding RLE run header"
+                ));
+            }
+        };
+
+        if byte_index == bit_util::MAX_VLQ_BYTE_LEN - 1 && byte & 0x7e != 0 {
+            return Err(general_err!(
+                "parquet_data_error: RLE run header overflows u64"
+            ));
+        }
+        value |= u64::from(byte & 0x7f) << (byte_index * 7);
+
+        if byte & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+    }
+
+    Err(general_err!(
+        "parquet_data_error: RLE run header exceeds {} bytes",
+        bit_util::MAX_VLQ_BYTE_LEN
+    ))
 }
 
 #[allow(dead_code)]
@@ -914,6 +959,46 @@ mod tests {
 
         assert_eq!(decoded, 10);
         assert_eq!(runs.iter().map(|(_, length)| length).sum::<usize>(), 10);
+    }
+
+    #[test]
+    fn test_read_runs_rejects_overlong_run_header() {
+        assert_malformed_run_header(&[0x80; bit_util::MAX_VLQ_BYTE_LEN + 1]);
+    }
+
+    #[test]
+    fn test_read_runs_rejects_rle_run_length_overflow() {
+        let header = encode_run_header((u64::from(u32::MAX) + 1) << 1);
+        assert_malformed_run_header(&header);
+    }
+
+    #[test]
+    fn test_read_runs_rejects_bit_packed_run_length_overflow() {
+        let overflowing_group_count = u64::from(u32::MAX) / BIT_PACK_GROUP_SIZE as u64 + 1;
+        let header = encode_run_header((overflowing_group_count << 1) | 1);
+        assert_malformed_run_header(&header);
+    }
+
+    #[test]
+    fn test_read_runs_rejects_zero_group_bit_packed_run() {
+        assert_malformed_run_header(&[1]);
+    }
+
+    fn assert_malformed_run_header(header: &[u8]) {
+        let mut data = vec![2, 0];
+        data.extend_from_slice(header);
+        let mut decoder = RleDecoder::new(1);
+        decoder.set_data(Bytes::from(data)).unwrap();
+        let mut runs = vec![(7, 1)];
+
+        assert!(decoder.read_runs_into(2, &mut runs).is_err());
+        assert_eq!(runs, vec![(7, 1)]);
+    }
+
+    fn encode_run_header(value: u64) -> Vec<u8> {
+        let mut writer = BitWriter::new(bit_util::MAX_VLQ_BYTE_LEN);
+        writer.put_vlq_int(value);
+        writer.consume()
     }
 
     #[test]
